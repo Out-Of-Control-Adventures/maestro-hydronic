@@ -1,0 +1,28 @@
+# .gitignore for Maestro Hydronic
+
+# ESPHome build artifacts
+.esphome/
+**/.pioenvs/
+**/.piolibdeps/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets (never commit these)
+secrets.yaml
+
+# Build outputs
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
