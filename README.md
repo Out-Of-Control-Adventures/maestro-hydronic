@@ -4,6 +4,10 @@
 
 This project is in early development — I'm sharing the design publicly to gather feedback from the community before building. If you're into hydronic heating, van builds, or ESP32 projects, I'd love your input. Open an issue, start a discussion, or just poke holes in the design.
 
+![Maestro Hydronic v0.6 — WT32-SC01 Plus running LVGL UI alongside Home Assistant dashboard](hardware/photos/build-v06.jpg)
+
+*v0.6 desktop proof-of-concept: WT32-SC01 Plus running the LVGL touchscreen UI (right), synced with the Home Assistant dashboard (left). All temperatures are dummy values for UI testing.*
+
 ---
 
 ## Complete Project Specification
