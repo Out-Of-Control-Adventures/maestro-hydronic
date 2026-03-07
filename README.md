@@ -201,17 +201,32 @@ Pin 8: Spare            ─┘ Brown twisted pair
 
 ### 4.4 Main Controller GPIO Assignment (WT32-SC01 Plus)
 
+> **Note:** The WT32-SC01 Plus has several GPIOs hardwired to on-board peripherals (touchscreen I²C, backlight) that are not available for external use. The table below reflects the corrected assignments. GPIOs 5, 6, 7, and 45 are consumed by the board itself and must not be assigned to relays or other external functions.
+
+**Reserved by WT32-SC01 Plus hardware (do not use):**
+
+| GPIO | Reserved For |
+|------|-------------|
+| GPIO5 | Touch controller I²C SCL (CST820) |
+| GPIO6 | Touch controller I²C SDA (CST820) |
+| GPIO7 | Touch interrupt |
+| GPIO45 | Backlight PWM |
+
+**Available for external assignment:**
+
 | GPIO | Function | Notes |
 |------|----------|-------|
-| GPIO21 | I²C SDA | Zone bus master |
-| GPIO22 | I²C SCL | Zone bus master |
+| GPIO21 | I²C SDA | Zone bus master (PCF8574 expanders) |
+| GPIO22 | I²C SCL | Zone bus master (PCF8574 expanders) |
 | GPIO4 | 1-Wire Data | DS18B20 sensors (all on one bus) |
-| GPIO5 | Relay 1 | Heater Enable |
-| GPIO6 | Relay 2 | Main Circulation Pump |
-| GPIO7 | Relay 3 | Spare |
+| GPIO1 | Relay 1 | Heater Enable |
+| GPIO2 | Relay 2 | Main Circulation Pump |
+| GPIO3 | Relay 3 | Spare |
 | GPIO8 | Relay 4 | Spare |
 | GPIO25 | CAN TX | Heater CANbus (optional) |
 | GPIO26 | CAN RX | Heater CANbus (optional) |
+
+> **⚠️ Confirm before wiring:** GPIO availability depends on which header pins are physically broken out on your specific WT32-SC01 Plus revision. Verify against the board's pinout diagram before connecting external hardware.
 
 ---
 
