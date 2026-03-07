@@ -1,0 +1,139 @@
+# Maestro Hydronic — Minimal Display Test
+# Flash this first to validate display + WiFi + touch
+# Then all future updates go OTA via ESPHome dashboard
+
+substitutions:
+  device_name: maestro-hydronic
+
+esphome:
+  name: ${device_name}
+  friendly_name: "Maestro Hydronic"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name}-fallback"
+    password: "maestro123"
+
+captive_portal:
+
+# --- Display (mipi_spi native support) ---
+spi:
+  - type: octal
+    id: octal_spi
+    clk_pin: 47
+    data_pins:
+      - 9
+      - ignore_strapping_warning: true
+        number: 46
+      - ignore_strapping_warning: true
+        number: 3
+      - 8
+      - 18
+      - 17
+      - 16
+      - 15
+
+power_supply:
+  - id: backlight
+    enable_on_boot: true
+    pin:
+      ignore_strapping_warning: true
+      number: GPIO45
+
+display:
+  - platform: mipi_spi
+    id: main_display
+    model: wt32-sc01-plus
+    data_rate: 10MHz
+    rotation: 90
+    auto_clear_enabled: false
+    update_interval: never
+
+# --- Touch ---
+i2c:
+  - id: touch_i2c
+    sda: GPIO6
+    scl: GPIO5
+    frequency: 400kHz
+
+touchscreen:
+  - platform: ft63x6
+    id: device_touchscreen
+    interrupt_pin: GPIO7
+    transform:
+      swap_xy: true
+      mirror_x: false
+      mirror_y: true
+
+# --- Minimal LVGL test ---
+lvgl:
+  displays: main_display
+  touchscreens: device_touchscreen
+  pages:
+    - id: test_page
+      bg_color: 0x141A1F
+      widgets:
+        - label:
+            align: CENTER
+            y: -40
+            text: "MAESTRO HYDRONIC"
+            text_color: 0x18bcf2
+        - label:
+            align: CENTER
+            y: 0
+            text: "Display OK"
+            text_color: 0x00B894
+        - label:
+            align: CENTER
+            y: 40
+            text: "Touch to test..."
+            text_color: 0x636E72
+        - button:
+            align: CENTER
+            y: 100
+            width: 200
+            height: 50
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "TOUCH ME"
+            on_press:
+              - lvgl.label.update:
+                  id: touch_result
+                  text: "Touch works!"
+                  text_color: 0x00B894
+        - label:
+            id: touch_result
+            align: CENTER
+            y: 60
+            text: ""
+            text_color: 0x636E72

@@ -1,0 +1,940 @@
+# =============================================================================
+# MAESTRO HYDRONIC — v0.4.0
+# =============================================================================
+# WT32-SC01 Plus | ESPHome 2026.2.4 + LVGL
+# Landscape 480x320 | USB cable on left
+#
+# v0.4 Changes:
+#   - heat-wave icon for floor
+#   - Bigger icons, no button outlines
+#   - Faster arc knob response
+#   - All ticks orange when heating
+#   - 4 zone switches exposed to HA (bidirectional)
+#   - Target temp exposed as number entity (bidirectional)
+#   - Real WiFi status
+#   - Display brightness + timeout exposed to HA
+#   - Settings + Info placeholder pages
+# =============================================================================
+
+substitutions:
+  device_name: 'maestro-hydronic'
+  friendly_name: 'Maestro Hydronic'
+  # MDI Icons
+  mdi_fire: "\U000F0238"
+  mdi_heat_wave: "\U000F1A01"
+  mdi_fan: "\U000F0210"
+  mdi_water: "\U000F058E"
+  mdi_cog: "\U000F0493"
+  mdi_info: "\U000F02FD"
+  mdi_wifi: "\U000F05A9"
+  mdi_wifi_off: "\U000F05AA"
+  mdi_arrow_left: "\U000F004D"
+  # Colors
+  color_white: "0xFFFFFF"
+  color_grey: "0xa5a5a5"
+  color_dark_grey: "0x111111"
+  color_bg: "0x000000"
+  color_light_grey: "0x444444"
+  color_accent: "0x18bcf2"
+  color_ring_ticks: "0x585858"
+  color_temp_needle: "0x35ffe6"
+  color_target_knob: "0xFF6D00"
+  color_heating_bg: "0x3D1D00"
+  color_warning: "0xE67E22"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    board_build.flash_mode: dio
+  on_boot:
+    - delay: 1s
+    - script.execute: turn_on_screen_light
+    - delay: 3s
+    - lvgl.widget.hide: boot_screen
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+  on_client_connected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - lvgl.label.update:
+              id: wifi_icon
+              text_color: ${color_accent}
+              text: ${mdi_wifi}
+  on_client_disconnected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - lvgl.label.update:
+              id: wifi_icon
+              text_color: ${color_warning}
+              text: ${mdi_wifi_off}
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name}-fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# =============================================================================
+# TIME
+# =============================================================================
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: America/Vancouver
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: update_time_label
+
+# =============================================================================
+# DISPLAY
+# =============================================================================
+spi:
+  - type: octal
+    id: octal_spi
+    clk_pin: 47
+    data_pins:
+      - 9
+      - ignore_strapping_warning: true
+        number: 46
+      - ignore_strapping_warning: true
+        number: 3
+      - 8
+      - 18
+      - 17
+      - 16
+      - 15
+
+display:
+  - platform: mipi_spi
+    id: main_display
+    model: wt32-sc01-plus
+    data_rate: 10MHz
+    rotation: 90
+    auto_clear_enabled: false
+    update_interval: never
+
+# =============================================================================
+# TOUCH
+# =============================================================================
+i2c:
+  - id: touch_i2c
+    sda: GPIO6
+    scl: GPIO5
+    frequency: 400kHz
+
+touchscreen:
+  - platform: ft63x6
+    id: device_touchscreen
+    interrupt_pin: GPIO7
+    transform:
+      swap_xy: true
+      mirror_x: false
+      mirror_y: true
+    on_touch:
+      - script.execute: turn_on_screen_light
+
+# =============================================================================
+# BACKLIGHT
+# =============================================================================
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+
+light:
+  - platform: monochromatic
+    id: backlight_light
+    name: Backlight
+    output: backlight_pwm
+    default_transition_length: 500ms
+    restore_mode: RESTORE_AND_ON
+
+# =============================================================================
+# SWITCHES — Zone controls (bidirectional with HA)
+# =============================================================================
+switch:
+  - platform: template
+    name: "Heater"
+    id: sw_heater
+    icon: mdi:fire
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: update_display
+    on_turn_off:
+      - script.execute: update_display
+
+  - platform: template
+    name: "Floor Heat"
+    id: sw_floor
+    icon: mdi:heat-wave
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: update_display
+    on_turn_off:
+      - script.execute: update_display
+
+  - platform: template
+    name: "Hot Air Fan"
+    id: sw_fan
+    icon: mdi:fan
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: update_display
+    on_turn_off:
+      - script.execute: update_display
+
+  - platform: template
+    name: "DHW"
+    id: sw_dhw
+    icon: mdi:water-pump
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: update_display
+    on_turn_off:
+      - script.execute: update_display
+
+# =============================================================================
+# NUMBER — Target temperature (bidirectional with HA)
+# =============================================================================
+number:
+  - platform: template
+    name: "Target Temperature"
+    id: target_temp_number
+    icon: mdi:thermometer
+    unit_of_measurement: "°C"
+    min_value: 10
+    max_value: 35
+    step: 0.5
+    initial_value: 22.0
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lvgl.arc.update:
+            id: target_temp_knob
+            value: !lambda return (int)(x * 10);
+        - script.execute: update_display
+
+  - platform: template
+    name: "Display Brightness"
+    id: display_brightness
+    icon: mdi:brightness-percent
+    unit_of_measurement: "%"
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 80
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - light.turn_on:
+            id: backlight_light
+            brightness: !lambda return x / 100.0;
+            transition_length: 500ms
+
+  - platform: template
+    name: "Screen Timeout"
+    id: screen_timeout
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    min_value: 30
+    max_value: 600
+    step: 30
+    initial_value: 180
+    restore_value: true
+    optimistic: true
+
+# =============================================================================
+# SENSORS
+# =============================================================================
+sensor:
+  - platform: template
+    name: "Room Temperature"
+    id: room_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: return 21.5;
+    on_value:
+      then:
+        - script.execute: update_display
+
+  - platform: template
+    name: "Loop Supply Temp"
+    id: loop_supply_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: return 65.0;
+    on_value:
+      then:
+        - script.execute: update_display
+
+  - platform: uptime
+    name: "Uptime"
+    id: sys_uptime
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      entity_category: diagnostic
+    ssid:
+      name: "WiFi SSID"
+      entity_category: diagnostic
+
+# =============================================================================
+# FONTS
+# =============================================================================
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 14
+    bpp: 4
+    glyphs: " !%()*+,-./0123456789:;<=>?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°"
+    extras:
+      - file: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+        glyphs:
+          - ${mdi_wifi}
+          - ${mdi_wifi_off}
+
+  - file: "gfonts://Roboto"
+    id: font_btn_icon
+    size: 28
+    bpp: 4
+    glyphs: " "
+    extras:
+      - file: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+        glyphs:
+          - ${mdi_fire}
+          - ${mdi_heat_wave}
+          - ${mdi_fan}
+          - ${mdi_water}
+          - ${mdi_cog}
+          - ${mdi_info}
+          - ${mdi_arrow_left}
+
+  - file: "gfonts://Roboto@700"
+    id: font_huge
+    size: 50
+    bpp: 4
+    glyphs: " -0123456789.°C"
+
+  - file: "gfonts://Roboto"
+    id: font_target
+    size: 16
+    bpp: 4
+    glyphs: " -0123456789.°CTaget:rs"
+
+  - file: "gfonts://Roboto"
+    id: font_page_title
+    size: 20
+    bpp: 4
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    extras:
+      - file: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+        glyphs:
+          - ${mdi_arrow_left}
+
+# =============================================================================
+# SCRIPTS
+# =============================================================================
+script:
+  - id: turn_on_screen_light
+    mode: restart
+    then:
+      - lvgl.resume:
+      - light.turn_on:
+          id: backlight_light
+          brightness: !lambda return id(display_brightness).state / 100.0;
+          transition_length: 500ms
+
+  - id: idle_screen_off
+    mode: restart
+    then:
+      - delay: !lambda return id(screen_timeout).state * 1000;
+      - light.turn_on:
+          id: backlight_light
+          brightness: 40%
+          transition_length: 3s
+      - delay: 30s
+      - light.turn_off:
+          id: backlight_light
+      - lvgl.pause:
+          show_snow: true
+
+  - id: update_time_label
+    then:
+      - lvgl.label.update:
+          id: time_label
+          text: !lambda |-
+            static char buf[20];
+            auto now = id(ha_time).now();
+            if (!now.is_valid()) return "No time";
+            int h = now.hour;
+            int m = now.minute;
+            const char* ampm = h >= 12 ? "PM" : "AM";
+            h = h % 12;
+            if (h == 0) h = 12;
+            snprintf(buf, sizeof(buf), "%d:%02d %s PST", h, m, ampm);
+            return buf;
+
+  - id: update_display
+    then:
+      - lambda: |-
+          float current = id(room_temp).has_state() ? id(room_temp).state : 0;
+          float target = id(target_temp_number).state;
+          bool heating_needed = target > current;
+
+          // --- Room temperature needle ---
+          lv_meter_set_indicator_value(id(meter_ticks), id(room_temp_needle),
+            (int)(current * 10));
+
+          // --- Center temp label ---
+          lv_label_set_text(id(main_temp_label),
+            str_sprintf("%.1f", current).c_str());
+
+          // --- Target temp label ---
+          lv_label_set_text(id(target_temp_label),
+            str_sprintf("Target: %.1f°C", target).c_str());
+
+          // --- All ticks orange when heating needed ---
+          if (heating_needed) {
+            lv_meter_set_indicator_start_value(id(meter_ticks), id(heating_ticks), 100);
+            lv_meter_set_indicator_end_value(id(meter_ticks), id(heating_ticks), 350);
+            lv_obj_set_style_bg_color(id(ring_inner_bg), lv_color_hex(0x3D1D00), 0);
+            lv_obj_set_style_border_color(id(ring_inner_bg), lv_color_hex(0x2A1300), 0);
+            lv_obj_set_style_text_color(id(target_temp_label), lv_color_hex(0xFF6D00), 0);
+          } else {
+            lv_meter_set_indicator_start_value(id(meter_ticks), id(heating_ticks), 0);
+            lv_meter_set_indicator_end_value(id(meter_ticks), id(heating_ticks), 0);
+            lv_obj_set_style_bg_color(id(ring_inner_bg), lv_color_hex(0x000000), 0);
+            lv_obj_set_style_border_color(id(ring_inner_bg), lv_color_hex(0x111111), 0);
+            lv_obj_set_style_text_color(id(target_temp_label), lv_color_hex(0xa5a5a5), 0);
+          }
+
+          // --- Loop temp top right ---
+          if (id(loop_supply_temp).has_state()) {
+            lv_label_set_text(id(loop_temp_label),
+              str_sprintf("Loop: %.0f°C", id(loop_supply_temp).state).c_str());
+          }
+
+          // --- Button icon colors from switch states ---
+          lv_obj_set_style_text_color(id(heater_btn_icon),
+            id(sw_heater).state ? lv_color_hex(0xE74C3C) : lv_color_hex(0xa5a5a5), 0);
+          lv_obj_set_style_text_color(id(floor_btn_icon),
+            id(sw_floor).state ? lv_color_hex(0xF39C12) : lv_color_hex(0xa5a5a5), 0);
+          lv_obj_set_style_text_color(id(fan_btn_icon),
+            id(sw_fan).state ? lv_color_hex(0x3498DB) : lv_color_hex(0xa5a5a5), 0);
+          lv_obj_set_style_text_color(id(dhw_btn_icon),
+            id(sw_dhw).state ? lv_color_hex(0x2ECC71) : lv_color_hex(0xa5a5a5), 0);
+
+# =============================================================================
+# INTERVAL
+# =============================================================================
+interval:
+  - interval: 5s
+    then:
+      - script.execute: update_display
+
+# =============================================================================
+# LVGL
+# =============================================================================
+lvgl:
+  displays: main_display
+  touchscreens: device_touchscreen
+  on_idle:
+    - timeout: !lambda return (uint32_t)(id(screen_timeout).state * 1000);
+      then:
+        - script.execute: idle_screen_off
+  bg_color: ${color_bg}
+  text_color: ${color_white}
+  scrollbar_mode: "OFF"
+  default_font: font_small
+
+  style_definitions:
+    # Invisible touch area button (no outline, no bg)
+    - id: style_zone_btn
+      bg_opa: TRANSP
+      border_width: 0
+      outline_width: 0
+      shadow_width: 0
+      radius: 50
+      height: 50
+      width: 50
+    # Button icon — larger, centered
+    - id: style_zone_btn_icon
+      align: CENTER
+      text_font: font_btn_icon
+      text_color: ${color_grey}
+
+  # TOP LAYER
+  top_layer:
+    widgets:
+      - label:
+          id: time_label
+          align: TOP_LEFT
+          x: 10
+          y: 8
+          text: "--:--"
+          text_font: font_small
+          text_color: ${color_grey}
+
+      - label:
+          id: loop_temp_label
+          align: TOP_RIGHT
+          x: -40
+          y: 8
+          text: "Loop: --°C"
+          text_font: font_small
+          text_color: ${color_accent}
+
+      - label:
+          id: wifi_icon
+          align: TOP_RIGHT
+          x: -10
+          y: 8
+          text: ${mdi_wifi_off}
+          text_font: font_small
+          text_color: ${color_warning}
+
+      # Boot splash
+      - obj:
+          id: boot_screen
+          x: 0
+          y: 0
+          width: 100%
+          height: 100%
+          bg_color: ${color_bg}
+          bg_opa: COVER
+          radius: 0
+          pad_all: 0
+          border_width: 0
+          widgets:
+            - label:
+                align: CENTER
+                y: -20
+                text: "MAESTRO"
+                text_font: font_huge
+                text_color: ${color_accent}
+            - label:
+                align: CENTER
+                y: 30
+                text: "HYDRONIC"
+                text_font: font_page_title
+                text_color: ${color_grey}
+            - spinner:
+                align: CENTER
+                y: 80
+                height: 40
+                width: 40
+                spin_time: 1s
+                arc_length: 60deg
+                arc_width: 6
+                indicator:
+                  arc_color: ${color_accent}
+                  arc_width: 6
+          on_press:
+            - lvgl.widget.hide: boot_screen
+
+  # =========================================================================
+  # PAGES
+  # =========================================================================
+  pages:
+    # =====================================================================
+    # MAIN PAGE
+    # =====================================================================
+    - id: main_page
+      widgets:
+        # Layer 1: Outer arc
+        - arc:
+            height: 230
+            width: 230
+            y: -25
+            align: CENTER
+            arc_color: ${color_light_grey}
+            arc_opa: COVER
+            arc_width: 8
+            arc_rounded: false
+            knob:
+              bg_color: ${color_white}
+
+        # Layer 2: Dark ring
+        - obj:
+            height: 218
+            width: 218
+            y: -25
+            radius: 110
+            align: CENTER
+            border_width: 35
+            border_color: ${color_dark_grey}
+            bg_color: ${color_bg}
+
+        # Layer 3: Meter (10-35C x10)
+        - meter:
+            id: meter_ticks
+            height: 228
+            width: 228
+            y: -25
+            align: CENTER
+            bg_opa: TRANSP
+            border_width: 0
+            scales:
+              range_from: 100
+              range_to: 350
+              ticks:
+                count: 51
+                length: 16
+                width: 2
+                color: ${color_ring_ticks}
+              indicators:
+                # Room temp needle (cyan)
+                - line:
+                    id: room_temp_needle
+                    color: ${color_temp_needle}
+                    width: 3
+                    r_mod: 8
+                    value: 215
+                # Heating ticks (orange, full range when heating)
+                - tick_style:
+                    id: heating_ticks
+                    start_value: 0
+                    end_value: 0
+                    color_start: ${color_target_knob}
+                    color_end: ${color_target_knob}
+                    width: 2
+
+        # Layer 4: Inner bg (orange glow when heating)
+        - obj:
+            id: ring_inner_bg
+            height: 165
+            width: 165
+            y: -25
+            radius: 83
+            align: CENTER
+            border_width: 10
+            border_color: ${color_dark_grey}
+            bg_color: ${color_bg}
+
+        # Layer 5: Target temp knob (draggable)
+        - arc:
+            id: target_temp_knob
+            align: CENTER
+            y: -25
+            width: 200
+            height: 200
+            arc_opa: TRANSP
+            adjustable: true
+            min_value: 100
+            max_value: 350
+            value: 220
+            arc_width: 20
+            change_rate: 60
+            indicator:
+              arc_opa: TRANSP
+              arc_width: 20
+            knob:
+              bg_color: ${color_target_knob}
+              border_width: 3
+              border_color: ${color_white}
+              width: 20
+              height: 20
+              radius: 10
+            on_change:
+              then:
+                - lambda: |-
+                    float new_target = x / 10.0;
+                    new_target = roundf(new_target * 2) / 2;
+                    auto call = id(target_temp_number).make_call();
+                    call.set_value(new_target);
+                    call.perform();
+
+        # ===== CENTER LABELS =====
+        - label:
+            align: CENTER
+            y: -68
+            text: "ROOM"
+            text_font: font_small
+            text_color: ${color_grey}
+
+        - label:
+            id: main_temp_label
+            align: CENTER
+            y: -28
+            text_font: font_huge
+            text: "---"
+            text_color: ${color_white}
+
+        - label:
+            align: CENTER
+            x: 55
+            y: -40
+            text: "°C"
+            text_font: font_small
+            text_color: ${color_grey}
+
+        - label:
+            id: target_temp_label
+            align: CENTER
+            y: 15
+            text_font: font_target
+            text: "Target: 22.0°C"
+            text_color: ${color_grey}
+
+        # ===== BUTTON ROW (flex container) =====
+        - obj:
+            align: BOTTOM_MID
+            width: 460
+            height: 56
+            y: -4
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+              flex_align_cross: CENTER
+            widgets:
+              # 1: HEATER
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: heater_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_fire}
+                  on_press:
+                    - switch.toggle: sw_heater
+
+              # 2: FLOOR
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: floor_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_heat_wave}
+                  on_press:
+                    - switch.toggle: sw_floor
+
+              # 3: FAN
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: fan_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_fan}
+                  on_press:
+                    - switch.toggle: sw_fan
+
+              # 4: DHW
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: dhw_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_water}
+                  on_press:
+                    - switch.toggle: sw_dhw
+
+              # 5: SETTINGS
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: settings_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_cog}
+                  on_press:
+                    - lvgl.page.show: settings_page
+
+              # 6: INFO
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: info_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_info}
+                  on_press:
+                    - lvgl.page.show: info_page
+
+    # =====================================================================
+    # SETTINGS PAGE (placeholder)
+    # =====================================================================
+    - id: settings_page
+      bg_color: ${color_bg}
+      widgets:
+        - obj:
+            width: 460
+            height: 300
+            align: TOP_MID
+            y: 10
+            bg_color: "0x0A0A0A"
+            radius: 12
+            border_width: 0
+            pad_all: 16
+            layout:
+              type: FLEX
+              flex_flow: COLUMN
+              flex_align_main: START
+              flex_align_cross: START
+              pad_row: 12
+            widgets:
+              - obj:
+                  width: 430
+                  height: 34
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_cross: CENTER
+                    pad_column: 10
+                  widgets:
+                    - button:
+                        width: 40
+                        height: 34
+                        bg_opa: TRANSP
+                        border_width: 0
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: font_btn_icon
+                              text: ${mdi_arrow_left}
+                              text_color: ${color_accent}
+                        on_click:
+                          - lvgl.page.show: main_page
+                    - label:
+                        text: "Settings"
+                        text_font: font_page_title
+                        text_color: ${color_accent}
+              - label:
+                  text: "Settings page coming soon"
+                  text_color: ${color_grey}
+              - label:
+                  text: "Brightness and timeout adjustable from HA"
+                  text_color: ${color_grey}
+
+    # =====================================================================
+    # INFO PAGE (placeholder)
+    # =====================================================================
+    - id: info_page
+      bg_color: ${color_bg}
+      widgets:
+        - obj:
+            width: 460
+            height: 300
+            align: TOP_MID
+            y: 10
+            bg_color: "0x0A0A0A"
+            radius: 12
+            border_width: 0
+            pad_all: 16
+            layout:
+              type: FLEX
+              flex_flow: COLUMN
+              flex_align_main: START
+              flex_align_cross: START
+              pad_row: 8
+            widgets:
+              - obj:
+                  width: 430
+                  height: 34
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_cross: CENTER
+                    pad_column: 10
+                  widgets:
+                    - button:
+                        width: 40
+                        height: 34
+                        bg_opa: TRANSP
+                        border_width: 0
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: font_btn_icon
+                              text: ${mdi_arrow_left}
+                              text_color: ${color_accent}
+                        on_click:
+                          - lvgl.page.show: main_page
+                    - label:
+                        text: "Info"
+                        text_font: font_page_title
+                        text_color: ${color_accent}
+              - label:
+                  id: info_ip_label
+                  text: "IP: --"
+                  text_color: ${color_grey}
+              - label:
+                  id: info_wifi_label
+                  text: "WiFi: --"
+                  text_color: ${color_grey}
+              - label:
+                  id: info_uptime_label
+                  text: "Uptime: --"
+                  text_color: ${color_grey}
+              - label:
+                  text: "Maestro Hydronic v0.4.0"
+                  text_color: ${color_light_grey}
+              - label:
+                  text: "github.com/Out-Of-Control-Adventures"
+                  text_color: ${color_light_grey}

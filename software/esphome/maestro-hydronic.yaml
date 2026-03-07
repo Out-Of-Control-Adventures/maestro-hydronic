@@ -1,0 +1,1653 @@
+# =============================================================================
+# MAESTRO HYDRONIC — v0.6.0
+# =============================================================================
+# WT32-SC01 Plus | ESPHome 2026.2.4 + LVGL
+# Landscape 480x320 | USB cable on left
+#
+# v0.6 Changes (from v5):
+#   - System Master power button (separate from heater indicator)
+#   - Heat Priority selector (Floor / Air / Both)
+#   - 3-state zone indicators (OFF / ENABLED / ON)
+#   - DHW zone with dedicated temp sensor and recirc trigger
+#   - 4x DUMMY adjustable temp sensors for testing
+#   - Control logic: automatic thermostat with hysteresis
+#   - Real Settings page with all controls + Info section
+#   - Info page removed (accessed from Settings)
+#   - Crash mitigations: static buffers, longer debounce, guarded updates
+# =============================================================================
+
+substitutions:
+  device_name: 'maestro-hydronic'
+  friendly_name: 'Maestro Hydronic'
+  mdi_power: "\U000F0425"
+  mdi_fire: "\U000F0238"
+  mdi_heat_wave: "\U000F1A45"
+  mdi_fan: "\U000F0210"
+  mdi_water_pump: "\U000F058E"
+  mdi_cog: "\U000F0493"
+  mdi_wifi: "\U000F05A9"
+  mdi_wifi_off: "\U000F05AA"
+  mdi_arrow_left: "\U000F004D"
+  mdi_chevron_up: "\U000F0143"
+  mdi_chevron_down: "\U000F0140"
+  color_white: "0xFFFFFF"
+  color_grey: "0xa5a5a5"
+  color_dark_grey: "0x111111"
+  color_bg: "0x000000"
+  color_light_grey: "0x444444"
+  color_accent: "0x18bcf2"
+  color_ring_ticks: "0x585858"
+  color_temp_needle: "0x35ffe6"
+  color_target_knob: "0xFF6D00"
+  color_warning: "0xE67E22"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    board_build.flash_mode: dio
+  on_boot:
+    - delay: 1s
+    - script.execute: turn_on_screen_light
+    - delay: 3s
+    - lvgl.widget.hide: boot_screen
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+  on_client_connected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - lvgl.label.update:
+              id: wifi_icon
+              text_color: ${color_accent}
+              text: ${mdi_wifi}
+  on_client_disconnected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - lvgl.label.update:
+              id: wifi_icon
+              text_color: ${color_warning}
+              text: ${mdi_wifi_off}
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name}-fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: America/Vancouver
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: update_time_label
+
+globals:
+  - id: g_temp_unit_f
+    type: bool
+    initial_value: "false"
+    restore_value: true
+
+# =============================================================================
+# DISPLAY HARDWARE (identical to v5)
+# =============================================================================
+spi:
+  - type: octal
+    id: octal_spi
+    clk_pin: 47
+    data_pins:
+      - 9
+      - ignore_strapping_warning: true
+        number: 46
+      - ignore_strapping_warning: true
+        number: 3
+      - 8
+      - 18
+      - 17
+      - 16
+      - 15
+
+display:
+  - platform: mipi_spi
+    id: main_display
+    model: wt32-sc01-plus
+    data_rate: 10MHz
+    rotation: 90
+    auto_clear_enabled: false
+    update_interval: never
+
+i2c:
+  - id: touch_i2c
+    sda: GPIO6
+    scl: GPIO5
+    frequency: 400kHz
+
+touchscreen:
+  - platform: ft63x6
+    id: device_touchscreen
+    interrupt_pin: GPIO7
+    transform:
+      swap_xy: true
+      mirror_x: false
+      mirror_y: true
+    on_touch:
+      - script.execute: turn_on_screen_light
+
+output:
+  - platform: ledc
+    id: backlight_pwm
+    pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+
+light:
+  - platform: monochromatic
+    id: backlight_light
+    name: Backlight
+    output: backlight_pwm
+    default_transition_length: 500ms
+    restore_mode: RESTORE_AND_ON
+
+# =============================================================================
+# SWITCHES
+# =============================================================================
+switch:
+  # User-toggleable
+  - platform: template
+    name: "System Master"
+    id: sw_system_master
+    icon: mdi:power
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: run_control_logic
+    on_turn_off:
+      - script.execute: run_control_logic
+
+  - platform: template
+    name: "DHW Recirc"
+    id: sw_dhw
+    icon: mdi:water-pump
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: update_display
+    on_turn_off:
+      - script.execute: update_display
+
+  # Read-only (controlled by logic only)
+  - platform: template
+    name: "Heater Running"
+    id: sw_heater
+    icon: mdi:fire
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Floor Zone Active"
+    id: sw_floor
+    icon: mdi:heat-wave
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    name: "Fan Zone Active"
+    id: sw_fan
+    icon: mdi:fan
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+# =============================================================================
+# NUMBER ENTITIES
+# =============================================================================
+number:
+  - platform: template
+    name: "Target Temperature"
+    id: target_temp_number
+    icon: mdi:thermometer
+    unit_of_measurement: "°C"
+    min_value: 10
+    max_value: 35
+    step: 0.5
+    initial_value: 22.0
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lvgl.arc.update:
+            id: target_temp_knob
+            value: !lambda return (int)(x * 10);
+        - script.execute: run_control_logic
+
+  # DUMMY sensors
+  - platform: template
+    name: "DUMMY Room Temperature"
+    id: dummy_room_temp
+    icon: mdi:thermometer
+    unit_of_measurement: "°C"
+    min_value: 5
+    max_value: 40
+    step: 0.5
+    initial_value: 21.5
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "DUMMY Glycol Loop Temp"
+    id: dummy_glycol_loop_temp
+    icon: mdi:thermometer-high
+    unit_of_measurement: "°C"
+    min_value: 10
+    max_value: 95
+    step: 1
+    initial_value: 65
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "DUMMY DHW Loop Temp"
+    id: dummy_dhw_loop_temp
+    icon: mdi:thermometer-water
+    unit_of_measurement: "°C"
+    min_value: 5
+    max_value: 60
+    step: 1
+    initial_value: 35
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "DUMMY Floor Temperature"
+    id: dummy_floor_temp
+    icon: mdi:thermometer-lines
+    unit_of_measurement: "°C"
+    min_value: 10
+    max_value: 45
+    step: 1
+    initial_value: 20
+    restore_value: true
+    optimistic: true
+
+  # System settings
+  - platform: template
+    name: "Display Brightness"
+    id: display_brightness
+    icon: mdi:brightness-percent
+    unit_of_measurement: "%"
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 80
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lvgl.resume:
+        - light.turn_on:
+            id: backlight_light
+            brightness: !lambda return x / 100.0;
+            transition_length: 500ms
+
+  - platform: template
+    name: "Screen Timeout"
+    id: screen_timeout
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    min_value: 30
+    max_value: 600
+    step: 30
+    initial_value: 180
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "Hysteresis"
+    id: hysteresis
+    icon: mdi:delta
+    unit_of_measurement: "°C"
+    min_value: 0.1
+    max_value: 2.0
+    step: 0.1
+    initial_value: 0.5
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "Min Useful Loop Temp"
+    id: min_useful_loop_temp
+    icon: mdi:thermometer-low
+    unit_of_measurement: "°C"
+    min_value: 25
+    max_value: 50
+    step: 1
+    initial_value: 40
+    restore_value: true
+    optimistic: true
+
+  - platform: template
+    name: "DHW Target Temp"
+    id: dhw_target_temp
+    icon: mdi:water-thermometer
+    unit_of_measurement: "°C"
+    min_value: 30
+    max_value: 55
+    step: 1
+    initial_value: 45
+    restore_value: true
+    optimistic: true
+
+# =============================================================================
+# SELECT ENTITIES
+# =============================================================================
+select:
+  - platform: template
+    name: "Temperature Unit"
+    id: temp_unit_select
+    icon: mdi:temperature-celsius
+    options:
+      - "C"
+      - "F"
+    initial_option: "C"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: id(g_temp_unit_f) = (x == "F");
+        - script.execute: update_display
+
+  - platform: template
+    name: "Heat Priority"
+    id: heat_priority_select
+    icon: mdi:priority-high
+    options:
+      - "Floor"
+      - "Air"
+      - "Both"
+    initial_option: "Both"
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - script.execute: run_control_logic
+
+# =============================================================================
+# SENSORS
+# =============================================================================
+sensor:
+  - platform: template
+    name: "Room Temperature"
+    id: room_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: return id(dummy_room_temp).state;
+    on_value:
+      then:
+        - script.execute: run_control_logic
+
+  - platform: template
+    name: "Glycol Loop Temperature"
+    id: loop_supply_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: return id(dummy_glycol_loop_temp).state;
+    on_value:
+      then:
+        - script.execute: update_display
+
+  - platform: template
+    name: "DHW Loop Temperature"
+    id: dhw_loop_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: return id(dummy_dhw_loop_temp).state;
+    on_value:
+      then:
+        - script.execute: update_display
+
+  - platform: template
+    name: "Floor Temperature"
+    id: floor_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: return id(dummy_floor_temp).state;
+
+  - platform: uptime
+    name: "Uptime"
+    id: sys_uptime
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      id: wifi_ip
+      entity_category: diagnostic
+    ssid:
+      name: "WiFi SSID"
+      id: wifi_ssid_info
+      entity_category: diagnostic
+
+  - platform: template
+    name: "System State"
+    id: system_state
+    icon: mdi:state-machine
+    update_interval: never
+
+# =============================================================================
+# FONTS — all glyph sets verified unique
+# =============================================================================
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 14
+    bpp: 4
+    glyphs: " !%()*+,-./0123456789:;<=>?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    extras:
+      - file: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+        glyphs:
+          - ${mdi_wifi}
+          - ${mdi_wifi_off}
+
+  - file: "gfonts://Roboto"
+    id: font_btn_icon
+    size: 32
+    bpp: 4
+    glyphs: " "
+    extras:
+      - file: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+        glyphs:
+          - ${mdi_power}
+          - ${mdi_fire}
+          - ${mdi_heat_wave}
+          - ${mdi_fan}
+          - ${mdi_water_pump}
+          - ${mdi_cog}
+          - ${mdi_arrow_left}
+          - ${mdi_chevron_up}
+          - ${mdi_chevron_down}
+
+  - file: "gfonts://Roboto@700"
+    id: font_huge
+    size: 50
+    bpp: 4
+    glyphs: " -0123456789."
+
+  - file: "gfonts://Roboto@700"
+    id: font_boot
+    size: 50
+    bpp: 4
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+  - file: "gfonts://Roboto"
+    id: font_target
+    size: 16
+    bpp: 4
+    glyphs: " 0123456789.:CFHTSDABEGINOYabedfghilnorstuvy"
+
+  - file: "gfonts://Roboto@500"
+    id: font_page_title
+    size: 20
+    bpp: 4
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./:-%"
+    extras:
+      - file: "https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf"
+        glyphs:
+          - ${mdi_arrow_left}
+
+  - file: "gfonts://Roboto@500"
+    id: font_settings_val
+    size: 18
+    bpp: 4
+    glyphs: " 0123456789.%CFs"
+
+  - file: "gfonts://Roboto"
+    id: font_dhw_temp
+    size: 11
+    bpp: 4
+    glyphs: " 0123456789.-"
+
+# =============================================================================
+# SCRIPTS
+# =============================================================================
+script:
+  - id: turn_on_screen_light
+    mode: restart
+    then:
+      - lvgl.resume:
+      - light.turn_on:
+          id: backlight_light
+          brightness: !lambda return id(display_brightness).state / 100.0;
+          transition_length: 500ms
+
+  - id: idle_screen_off
+    mode: restart
+    then:
+      - delay: !lambda return (int)(id(screen_timeout).state) * 1000;
+      - light.turn_on:
+          id: backlight_light
+          brightness: 40%
+          transition_length: 3s
+      - delay: 30s
+      - light.turn_off:
+          id: backlight_light
+      - lvgl.pause:
+          show_snow: true
+
+  - id: update_time_label
+    then:
+      - lvgl.label.update:
+          id: time_label
+          text: !lambda |-
+            static char buf[20];
+            auto now = id(ha_time).now();
+            if (!now.is_valid()) return (const char*)"--:--";
+            int h = now.hour;
+            int m = now.minute;
+            const char* ampm = h >= 12 ? "PM" : "AM";
+            h = h % 12;
+            if (h == 0) h = 12;
+            snprintf(buf, sizeof(buf), "%d:%02d %s", h, m, ampm);
+            return (const char*)buf;
+
+  # Throttled target temp commit — 300ms to prevent crash from rapid arc
+  - id: commit_target_temp
+    mode: restart
+    then:
+      - delay: 300ms
+      - lambda: |-
+          int raw = lv_arc_get_value(id(target_temp_knob));
+          float new_target = raw / 10.0f;
+          new_target = roundf(new_target * 2.0f) / 2.0f;
+          auto call = id(target_temp_number).make_call();
+          call.set_value(new_target);
+          call.perform();
+
+  # =========================================================================
+  # CONTROL LOGIC
+  # =========================================================================
+  - id: run_control_logic
+    mode: restart
+    then:
+      - delay: 50ms
+      - lambda: |-
+          bool master = id(sw_system_master).state;
+          float current = id(room_temp).has_state() ? id(room_temp).state : 0;
+          float target = id(target_temp_number).state;
+          float hyst = id(hysteresis).state;
+          float loop_t = id(loop_supply_temp).has_state() ? id(loop_supply_temp).state : 0;
+          float min_loop = id(min_useful_loop_temp).state;
+
+          std::string prio = "Both";
+          if (id(heat_priority_select).has_state())
+            prio = id(heat_priority_select).current_option().c_str();
+          bool floor_prio = (prio == "Floor" || prio == "Both");
+          bool fan_prio = (prio == "Air" || prio == "Both");
+
+          bool heater_on = false;
+          bool floor_active = false;
+          bool fan_active = false;
+          const char* state_str = "OFF";
+
+          if (!master) {
+            state_str = "OFF";
+          } else if (current < (target - hyst)) {
+            state_str = "HEATING";
+            heater_on = true;
+            if (floor_prio) floor_active = true;
+            if (fan_prio && loop_t >= min_loop) fan_active = true;
+          } else if (current >= target) {
+            if (id(sw_dhw).state) {
+              state_str = "SATISFIED";
+              heater_on = true;
+            } else {
+              state_str = "STANDBY";
+            }
+          } else {
+            // Dead band — hold previous state
+            std::string prev = id(system_state).has_state() ?
+              id(system_state).state : "STANDBY";
+            if (prev == "HEATING") {
+              state_str = "HEATING";
+              heater_on = true;
+              if (floor_prio) floor_active = true;
+              if (fan_prio && loop_t >= min_loop) fan_active = true;
+            } else {
+              state_str = id(sw_dhw).state ? "SATISFIED" : "STANDBY";
+              heater_on = id(sw_dhw).state;
+            }
+          }
+
+          // Apply — only toggle if changed
+          if (id(sw_heater).state != heater_on) {
+            if (heater_on) id(sw_heater).turn_on(); else id(sw_heater).turn_off();
+          }
+          if (id(sw_floor).state != floor_active) {
+            if (floor_active) id(sw_floor).turn_on(); else id(sw_floor).turn_off();
+          }
+          if (id(sw_fan).state != fan_active) {
+            if (fan_active) id(sw_fan).turn_on(); else id(sw_fan).turn_off();
+          }
+
+          id(system_state).publish_state(state_str);
+      - script.execute: update_display
+
+  # =========================================================================
+  # DISPLAY UPDATE — static buffers to prevent use-after-free crashes
+  # =========================================================================
+  - id: update_display
+    mode: restart
+    then:
+      - delay: 20ms
+      - lambda: |-
+          static char b_main[16];
+          static char b_tgt[32];
+          static char b_stat[16];
+          static char b_loop[24];
+          static char b_dhw[8];
+          static char b_hyst[8];
+          static char b_mloop[8];
+          static char b_bri[8];
+          static char b_tmo[8];
+          static char b_info1[40];
+          static char b_info2[40];
+          static char b_info3[24];
+          static char b_info4[24];
+
+          float current = id(room_temp).has_state() ? id(room_temp).state : 0;
+          float target = id(target_temp_number).state;
+          bool master = id(sw_system_master).state;
+          bool use_f = id(g_temp_unit_f);
+          std::string sys = id(system_state).has_state() ? id(system_state).state : "OFF";
+          bool heating = (sys == "HEATING");
+
+          auto cf = [use_f](float c) -> float { return use_f ? (c * 1.8f + 32.0f) : c; };
+          const char* u = use_f ? "F" : "C";
+
+          // Ring gauge needles
+          lv_meter_set_indicator_value(id(meter_ticks), id(room_temp_needle), (int)(current * 10));
+          lv_meter_set_indicator_value(id(meter_ticks), id(target_temp_needle), (int)(target * 10));
+
+          // Center labels
+          snprintf(b_main, sizeof(b_main), "%.1f", cf(current));
+          lv_label_set_text(id(main_temp_label), b_main);
+
+          snprintf(b_tgt, sizeof(b_tgt), "Target: %.1f %s", cf(target), u);
+          lv_label_set_text(id(target_temp_label), b_tgt);
+
+          // Status
+          snprintf(b_stat, sizeof(b_stat), "%s", sys.c_str());
+          lv_label_set_text(id(status_label), b_stat);
+          uint32_t sc = 0xa5a5a5;
+          if (sys == "HEATING") sc = 0xFF6D00;
+          else if (sys == "SATISFIED") sc = 0x2ECC71;
+          else if (sys == "STANDBY") sc = 0x18bcf2;
+          lv_obj_set_style_text_color(id(status_label), lv_color_hex(sc), 0);
+
+          // Heating ticks + glow
+          if (master && heating) {
+            lv_meter_set_indicator_start_value(id(meter_ticks), id(heating_ticks), 100);
+            lv_meter_set_indicator_end_value(id(meter_ticks), id(heating_ticks), (int)(target * 10));
+            lv_obj_set_style_bg_color(id(ring_inner_bg), lv_color_hex(0x3D1D00), 0);
+            lv_obj_set_style_border_color(id(ring_inner_bg), lv_color_hex(0x2A1300), 0);
+            lv_obj_set_style_text_color(id(target_temp_label), lv_color_hex(0xFF6D00), 0);
+          } else {
+            lv_meter_set_indicator_start_value(id(meter_ticks), id(heating_ticks), 0);
+            lv_meter_set_indicator_end_value(id(meter_ticks), id(heating_ticks), 0);
+            lv_obj_set_style_bg_color(id(ring_inner_bg), lv_color_hex(0x000000), 0);
+            lv_obj_set_style_border_color(id(ring_inner_bg), lv_color_hex(0x111111), 0);
+            lv_obj_set_style_text_color(id(target_temp_label), lv_color_hex(0xa5a5a5), 0);
+          }
+
+          // Loop temp top-right
+          snprintf(b_loop, sizeof(b_loop), "Loop: %.0f %s",
+            cf(id(loop_supply_temp).has_state() ? id(loop_supply_temp).state : 0), u);
+          lv_label_set_text(id(loop_temp_label), b_loop);
+
+          // DHW temp near icon
+          snprintf(b_dhw, sizeof(b_dhw), "%.0f",
+            cf(id(dhw_loop_temp).has_state() ? id(dhw_loop_temp).state : 0));
+          lv_label_set_text(id(dhw_temp_label), b_dhw);
+
+          // Button colors
+          lv_obj_set_style_text_color(id(power_btn_icon),
+            master ? lv_color_hex(0x2ECC71) : lv_color_hex(0xa5a5a5), 0);
+          lv_obj_set_style_text_color(id(heater_btn_icon),
+            id(sw_heater).state ? lv_color_hex(0xE74C3C) : lv_color_hex(0xa5a5a5), 0);
+
+          // Floor 3-state
+          std::string prio = "Both";
+          if (id(heat_priority_select).has_state())
+            prio = id(heat_priority_select).current_option().c_str();
+          bool fl_p = (prio == "Floor" || prio == "Both");
+          uint32_t fc = 0xa5a5a5;
+          if (id(sw_floor).state) fc = 0xF39C12;
+          else if (fl_p && master) fc = 0x995E0B;
+          lv_obj_set_style_text_color(id(floor_btn_icon), lv_color_hex(fc), 0);
+
+          // Fan 3-state
+          bool fn_p = (prio == "Air" || prio == "Both");
+          uint32_t ac = 0xa5a5a5;
+          if (id(sw_fan).state) ac = 0x3498DB;
+          else if (fn_p && master) ac = 0x1F5B83;
+          lv_obj_set_style_text_color(id(fan_btn_icon), lv_color_hex(ac), 0);
+
+          // DHW: always enabled or on
+          float dhw_t = id(dhw_loop_temp).has_state() ? id(dhw_loop_temp).state : 0;
+          float dhw_tgt = id(dhw_target_temp).state;
+          lv_obj_set_style_text_color(id(dhw_btn_icon),
+            (dhw_t >= dhw_tgt) ? lv_color_hex(0x2ECC71) : lv_color_hex(0x1B7D44), 0);
+
+          // Settings page values
+          snprintf(b_hyst, sizeof(b_hyst), "%.1f", id(hysteresis).state);
+          lv_label_set_text(id(stg_hyst_val), b_hyst);
+
+          snprintf(b_mloop, sizeof(b_mloop), "%.0f", cf(id(min_useful_loop_temp).state));
+          lv_label_set_text(id(stg_minloop_val), b_mloop);
+
+          snprintf(b_bri, sizeof(b_bri), "%.0f%%", id(display_brightness).state);
+          lv_label_set_text(id(stg_bright_val), b_bri);
+
+          snprintf(b_tmo, sizeof(b_tmo), "%.0fs", id(screen_timeout).state);
+          lv_label_set_text(id(stg_timeout_val), b_tmo);
+
+          lv_label_set_text(id(stg_dhw_val), id(sw_dhw).state ? "ON" : "OFF");
+          lv_obj_set_style_text_color(id(stg_dhw_val),
+            id(sw_dhw).state ? lv_color_hex(0x2ECC71) : lv_color_hex(0xa5a5a5), 0);
+
+          // C/F button highlights
+          lv_obj_set_style_text_color(id(stg_unit_c),
+            !use_f ? lv_color_hex(0x18bcf2) : lv_color_hex(0xa5a5a5), 0);
+          lv_obj_set_style_text_color(id(stg_unit_f),
+            use_f ? lv_color_hex(0x18bcf2) : lv_color_hex(0xa5a5a5), 0);
+
+          // Heat priority button highlights
+          lv_obj_set_style_text_color(id(stg_prio_floor),
+            (prio == "Floor") ? lv_color_hex(0x18bcf2) : lv_color_hex(0xa5a5a5), 0);
+          lv_obj_set_style_text_color(id(stg_prio_air),
+            (prio == "Air") ? lv_color_hex(0x18bcf2) : lv_color_hex(0xa5a5a5), 0);
+          lv_obj_set_style_text_color(id(stg_prio_both),
+            (prio == "Both") ? lv_color_hex(0x18bcf2) : lv_color_hex(0xa5a5a5), 0);
+
+          // Info section at bottom of settings
+          if (id(wifi_ip).has_state()) {
+            snprintf(b_info1, sizeof(b_info1), "IP: %s", id(wifi_ip).state.c_str());
+            lv_label_set_text(id(stg_info_ip), b_info1);
+          }
+          if (id(wifi_ssid_info).has_state()) {
+            snprintf(b_info2, sizeof(b_info2), "WiFi: %s", id(wifi_ssid_info).state.c_str());
+            lv_label_set_text(id(stg_info_wifi), b_info2);
+          }
+          if (id(sys_uptime).has_state()) {
+            int tot = (int)id(sys_uptime).state;
+            snprintf(b_info3, sizeof(b_info3), "Uptime: %dh %dm", tot/3600, (tot%3600)/60);
+            lv_label_set_text(id(stg_info_uptime), b_info3);
+          }
+          snprintf(b_info4, sizeof(b_info4), "System: %s", sys.c_str());
+          lv_label_set_text(id(stg_info_state), b_info4);
+
+# =============================================================================
+# INTERVAL
+# =============================================================================
+interval:
+  - interval: 30s
+    then:
+      - script.execute: run_control_logic
+
+# =============================================================================
+# LVGL
+# =============================================================================
+lvgl:
+  displays: main_display
+  touchscreens: device_touchscreen
+  on_idle:
+    - timeout: 180000ms
+      then:
+        - script.execute: idle_screen_off
+  bg_color: ${color_bg}
+  text_color: ${color_white}
+  scrollbar_mode: "OFF"
+  default_font: font_small
+
+  style_definitions:
+    - id: style_zone_btn
+      bg_opa: TRANSP
+      border_width: 0
+      outline_width: 0
+      shadow_width: 0
+      radius: 50
+      height: 54
+      width: 54
+    - id: style_zone_btn_icon
+      align: CENTER
+      text_font: font_btn_icon
+      text_color: ${color_grey}
+    - id: style_stepper_btn
+      width: 30
+      height: 28
+      bg_opa: TRANSP
+      border_width: 0
+      pad_all: 0
+
+  top_layer:
+    widgets:
+      - label:
+          id: time_label
+          align: TOP_LEFT
+          x: 10
+          y: 8
+          text: "--:--"
+          text_font: font_small
+          text_color: ${color_grey}
+      - label:
+          id: loop_temp_label
+          align: TOP_RIGHT
+          x: -40
+          y: 8
+          text: "Loop: --"
+          text_font: font_small
+          text_color: ${color_grey}
+      - label:
+          id: wifi_icon
+          align: TOP_RIGHT
+          x: -10
+          y: 8
+          text: ${mdi_wifi_off}
+          text_font: font_small
+          text_color: ${color_warning}
+      - obj:
+          id: boot_screen
+          x: 0
+          y: 0
+          width: 100%
+          height: 100%
+          bg_color: ${color_bg}
+          bg_opa: COVER
+          radius: 0
+          pad_all: 0
+          border_width: 0
+          widgets:
+            - label:
+                align: CENTER
+                y: -20
+                text: "MAESTRO"
+                text_font: font_boot
+                text_color: ${color_accent}
+            - label:
+                align: CENTER
+                y: 30
+                text: "HYDRONIC"
+                text_font: font_page_title
+                text_color: ${color_grey}
+            - spinner:
+                align: CENTER
+                y: 80
+                height: 40
+                width: 40
+                spin_time: 1s
+                arc_length: 60deg
+                arc_width: 6
+                indicator:
+                  arc_color: ${color_accent}
+                  arc_width: 6
+          on_press:
+            - lvgl.widget.hide: boot_screen
+
+  pages:
+    # === MAIN PAGE ===
+    - id: main_page
+      widgets:
+        - arc:
+            height: 230
+            width: 230
+            y: -25
+            align: CENTER
+            arc_color: ${color_light_grey}
+            arc_opa: COVER
+            arc_width: 8
+            arc_rounded: false
+            knob:
+              bg_color: ${color_white}
+        - obj:
+            height: 218
+            width: 218
+            y: -25
+            radius: 110
+            align: CENTER
+            border_width: 35
+            border_color: ${color_dark_grey}
+            bg_color: ${color_bg}
+        - meter:
+            id: meter_ticks
+            height: 228
+            width: 228
+            y: -25
+            align: CENTER
+            bg_opa: TRANSP
+            border_width: 0
+            scales:
+              range_from: 100
+              range_to: 350
+              ticks:
+                count: 51
+                length: 16
+                width: 2
+                color: ${color_ring_ticks}
+              indicators:
+                - line:
+                    id: room_temp_needle
+                    color: ${color_temp_needle}
+                    width: 3
+                    r_mod: 8
+                    value: 215
+                - line:
+                    id: target_temp_needle
+                    color: ${color_target_knob}
+                    width: 4
+                    r_mod: 12
+                    value: 220
+                - tick_style:
+                    id: heating_ticks
+                    start_value: 0
+                    end_value: 0
+                    color_start: ${color_target_knob}
+                    color_end: ${color_target_knob}
+                    width: 2
+        - obj:
+            id: ring_inner_bg
+            height: 165
+            width: 165
+            y: -25
+            radius: 83
+            align: CENTER
+            border_width: 10
+            border_color: ${color_dark_grey}
+            bg_color: ${color_bg}
+        - arc:
+            id: target_temp_knob
+            align: CENTER
+            y: -25
+            width: 210
+            height: 210
+            arc_opa: TRANSP
+            adjustable: true
+            min_value: 100
+            max_value: 350
+            value: 220
+            arc_width: 30
+            change_rate: 90
+            indicator:
+              arc_opa: TRANSP
+              arc_width: 30
+            knob:
+              bg_opa: TRANSP
+              border_width: 0
+              shadow_width: 0
+              width: 1
+              height: 1
+            on_change:
+              then:
+                - script.execute: commit_target_temp
+        - label:
+            align: CENTER
+            y: -68
+            text: "ROOM"
+            text_font: font_small
+            text_color: ${color_grey}
+        - label:
+            id: main_temp_label
+            align: CENTER
+            y: -28
+            text_font: font_huge
+            text: "---"
+            text_color: ${color_white}
+        - label:
+            id: target_temp_label
+            align: CENTER
+            y: 15
+            text_font: font_target
+            text: "Target: 22.0 C"
+            text_color: ${color_grey}
+        - label:
+            id: status_label
+            align: CENTER
+            y: 48
+            text_font: font_target
+            text: "OFF"
+            text_color: ${color_grey}
+
+        # Button row: Power, Heater, Floor, Fan, DHW, Settings
+        - obj:
+            align: BOTTOM_MID
+            width: 460
+            height: 58
+            y: -2
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_EVENLY
+              flex_align_cross: CENTER
+            widgets:
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: power_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_power}
+                  on_press:
+                    - switch.toggle: sw_system_master
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: heater_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_fire}
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: floor_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_heat_wave}
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: fan_btn_icon
+                        styles: style_zone_btn_icon
+                        text: ${mdi_fan}
+              - obj:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        id: dhw_btn_icon
+                        align: CENTER
+                        text_font: font_btn_icon
+                        text: ${mdi_water_pump}
+                        text_color: ${color_grey}
+                    - label:
+                        id: dhw_temp_label
+                        align: TOP_RIGHT
+                        x: 2
+                        y: 2
+                        text: "--"
+                        text_font: font_dhw_temp
+                        text_color: ${color_grey}
+                  on_press:
+                    - switch.toggle: sw_dhw
+              - button:
+                  styles: style_zone_btn
+                  widgets:
+                    - label:
+                        styles: style_zone_btn_icon
+                        text: ${mdi_cog}
+                  on_press:
+                    - lvgl.page.show: settings_page
+
+    # === SETTINGS PAGE ===
+    - id: settings_page
+      bg_color: ${color_bg}
+      widgets:
+        - obj:
+            width: 460
+            height: 300
+            align: TOP_MID
+            y: 10
+            bg_color: "0x0A0A0A"
+            radius: 12
+            border_width: 0
+            pad_all: 12
+            layout:
+              type: FLEX
+              flex_flow: COLUMN
+              flex_align_main: START
+              flex_align_cross: START
+              pad_row: 2
+            widgets:
+              # Header
+              - obj:
+                  width: 436
+                  height: 28
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_cross: CENTER
+                    pad_column: 8
+                  widgets:
+                    - button:
+                        width: 36
+                        height: 28
+                        bg_opa: TRANSP
+                        border_width: 0
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: font_btn_icon
+                              text: ${mdi_arrow_left}
+                              text_color: ${color_accent}
+                        on_click:
+                          - lvgl.page.show: main_page
+                    - label:
+                        text: "Settings"
+                        text_font: font_page_title
+                        text_color: ${color_accent}
+
+              # Temperature Unit
+              - obj:
+                  width: 436
+                  height: 28
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Temp Unit"
+                        text_font: font_small
+                        text_color: ${color_grey}
+                    - obj:
+                        width: 70
+                        height: 26
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: END
+                          flex_align_cross: CENTER
+                          pad_column: 8
+                        widgets:
+                          - button:
+                              width: 28
+                              height: 24
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              widgets:
+                                - label:
+                                    id: stg_unit_c
+                                    align: CENTER
+                                    text: "C"
+                                    text_font: font_settings_val
+                                    text_color: ${color_accent}
+                              on_click:
+                                - select.set:
+                                    id: temp_unit_select
+                                    option: "C"
+                          - button:
+                              width: 28
+                              height: 24
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              widgets:
+                                - label:
+                                    id: stg_unit_f
+                                    align: CENTER
+                                    text: "F"
+                                    text_font: font_settings_val
+                                    text_color: ${color_grey}
+                              on_click:
+                                - select.set:
+                                    id: temp_unit_select
+                                    option: "F"
+
+              # Heat Priority
+              - obj:
+                  width: 436
+                  height: 28
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Heat Priority"
+                        text_font: font_small
+                        text_color: ${color_grey}
+                    - obj:
+                        width: 140
+                        height: 26
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: END
+                          flex_align_cross: CENTER
+                          pad_column: 4
+                        widgets:
+                          - button:
+                              width: 42
+                              height: 24
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              widgets:
+                                - label:
+                                    id: stg_prio_floor
+                                    align: CENTER
+                                    text: "Floor"
+                                    text_font: font_small
+                                    text_color: ${color_grey}
+                              on_click:
+                                - select.set:
+                                    id: heat_priority_select
+                                    option: "Floor"
+                          - button:
+                              width: 28
+                              height: 24
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              widgets:
+                                - label:
+                                    id: stg_prio_air
+                                    align: CENTER
+                                    text: "Air"
+                                    text_font: font_small
+                                    text_color: ${color_grey}
+                              on_click:
+                                - select.set:
+                                    id: heat_priority_select
+                                    option: "Air"
+                          - button:
+                              width: 38
+                              height: 24
+                              bg_opa: TRANSP
+                              border_width: 0
+                              pad_all: 0
+                              widgets:
+                                - label:
+                                    id: stg_prio_both
+                                    align: CENTER
+                                    text: "Both"
+                                    text_font: font_small
+                                    text_color: ${color_accent}
+                              on_click:
+                                - select.set:
+                                    id: heat_priority_select
+                                    option: "Both"
+
+              # Hysteresis
+              - obj:
+                  width: 436
+                  height: 28
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Hysteresis"
+                        text_font: font_small
+                        text_color: ${color_grey}
+                    - obj:
+                        width: 110
+                        height: 26
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: END
+                          flex_align_cross: CENTER
+                          pad_column: 4
+                        widgets:
+                          - button:
+                              styles: style_stepper_btn
+                              widgets:
+                                - label:
+                                    align: CENTER
+                                    text_font: font_btn_icon
+                                    text: ${mdi_chevron_down}
+                                    text_color: ${color_accent}
+                              on_click:
+                                - lambda: |-
+                                    float v = id(hysteresis).state - 0.1f;
+                                    if (v < 0.1f) v = 0.1f;
+                                    auto call = id(hysteresis).make_call();
+                                    call.set_value(v); call.perform();
+                          - label:
+                              id: stg_hyst_val
+                              text: "0.5"
+                              text_font: font_settings_val
+                              text_color: ${color_accent}
+                          - button:
+                              styles: style_stepper_btn
+                              widgets:
+                                - label:
+                                    align: CENTER
+                                    text_font: font_btn_icon
+                                    text: ${mdi_chevron_up}
+                                    text_color: ${color_accent}
+                              on_click:
+                                - lambda: |-
+                                    float v = id(hysteresis).state + 0.1f;
+                                    if (v > 2.0f) v = 2.0f;
+                                    auto call = id(hysteresis).make_call();
+                                    call.set_value(v); call.perform();
+
+              # Min Loop Temp
+              - obj:
+                  width: 436
+                  height: 28
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Min Loop Temp"
+                        text_font: font_small
+                        text_color: ${color_grey}
+                    - obj:
+                        width: 110
+                        height: 26
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: END
+                          flex_align_cross: CENTER
+                          pad_column: 4
+                        widgets:
+                          - button:
+                              styles: style_stepper_btn
+                              widgets:
+                                - label:
+                                    align: CENTER
+                                    text_font: font_btn_icon
+                                    text: ${mdi_chevron_down}
+                                    text_color: ${color_accent}
+                              on_click:
+                                - lambda: |-
+                                    float v = id(min_useful_loop_temp).state - 1;
+                                    if (v < 25) v = 25;
+                                    auto call = id(min_useful_loop_temp).make_call();
+                                    call.set_value(v); call.perform();
+                          - label:
+                              id: stg_minloop_val
+                              text: "40"
+                              text_font: font_settings_val
+                              text_color: ${color_accent}
+                          - button:
+                              styles: style_stepper_btn
+                              widgets:
+                                - label:
+                                    align: CENTER
+                                    text_font: font_btn_icon
+                                    text: ${mdi_chevron_up}
+                                    text_color: ${color_accent}
+                              on_click:
+                                - lambda: |-
+                                    float v = id(min_useful_loop_temp).state + 1;
+                                    if (v > 50) v = 50;
+                                    auto call = id(min_useful_loop_temp).make_call();
+                                    call.set_value(v); call.perform();
+
+              # DHW Keep-Alive
+              - obj:
+                  width: 436
+                  height: 28
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "DHW Keep-Alive"
+                        text_font: font_small
+                        text_color: ${color_grey}
+                    - button:
+                        width: 44
+                        height: 24
+                        bg_opa: TRANSP
+                        border_width: 0
+                        widgets:
+                          - label:
+                              id: stg_dhw_val
+                              align: CENTER
+                              text: "OFF"
+                              text_font: font_settings_val
+                              text_color: ${color_grey}
+                        on_click:
+                          - switch.toggle: sw_dhw
+
+              # Brightness
+              - obj:
+                  width: 436
+                  height: 28
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Brightness"
+                        text_font: font_small
+                        text_color: ${color_grey}
+                    - obj:
+                        width: 110
+                        height: 26
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: END
+                          flex_align_cross: CENTER
+                          pad_column: 4
+                        widgets:
+                          - button:
+                              styles: style_stepper_btn
+                              widgets:
+                                - label:
+                                    align: CENTER
+                                    text_font: font_btn_icon
+                                    text: ${mdi_chevron_down}
+                                    text_color: ${color_accent}
+                              on_click:
+                                - lambda: |-
+                                    float v = id(display_brightness).state - 5;
+                                    if (v < 5) v = 5;
+                                    auto call = id(display_brightness).make_call();
+                                    call.set_value(v); call.perform();
+                          - label:
+                              id: stg_bright_val
+                              text: "80%"
+                              text_font: font_settings_val
+                              text_color: ${color_accent}
+                          - button:
+                              styles: style_stepper_btn
+                              widgets:
+                                - label:
+                                    align: CENTER
+                                    text_font: font_btn_icon
+                                    text: ${mdi_chevron_up}
+                                    text_color: ${color_accent}
+                              on_click:
+                                - lambda: |-
+                                    float v = id(display_brightness).state + 5;
+                                    if (v > 100) v = 100;
+                                    auto call = id(display_brightness).make_call();
+                                    call.set_value(v); call.perform();
+
+              # Screen Timeout
+              - obj:
+                  width: 436
+                  height: 28
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: SPACE_BETWEEN
+                    flex_align_cross: CENTER
+                  widgets:
+                    - label:
+                        text: "Screen Timeout"
+                        text_font: font_small
+                        text_color: ${color_grey}
+                    - obj:
+                        width: 110
+                        height: 26
+                        bg_opa: TRANSP
+                        border_width: 0
+                        pad_all: 0
+                        layout:
+                          type: FLEX
+                          flex_flow: ROW
+                          flex_align_main: END
+                          flex_align_cross: CENTER
+                          pad_column: 4
+                        widgets:
+                          - button:
+                              styles: style_stepper_btn
+                              widgets:
+                                - label:
+                                    align: CENTER
+                                    text_font: font_btn_icon
+                                    text: ${mdi_chevron_down}
+                                    text_color: ${color_accent}
+                              on_click:
+                                - lambda: |-
+                                    float v = id(screen_timeout).state - 30;
+                                    if (v < 30) v = 30;
+                                    auto call = id(screen_timeout).make_call();
+                                    call.set_value(v); call.perform();
+                          - label:
+                              id: stg_timeout_val
+                              text: "180s"
+                              text_font: font_settings_val
+                              text_color: ${color_accent}
+                          - button:
+                              styles: style_stepper_btn
+                              widgets:
+                                - label:
+                                    align: CENTER
+                                    text_font: font_btn_icon
+                                    text: ${mdi_chevron_up}
+                                    text_color: ${color_accent}
+                              on_click:
+                                - lambda: |-
+                                    float v = id(screen_timeout).state + 30;
+                                    if (v > 600) v = 600;
+                                    auto call = id(screen_timeout).make_call();
+                                    call.set_value(v); call.perform();
+
+              # Divider
+              - obj:
+                  width: 436
+                  height: 1
+                  bg_color: ${color_light_grey}
+                  border_width: 0
+                  pad_all: 0
+
+              # Info section
+              - label:
+                  id: stg_info_ip
+                  text: "IP: --"
+                  text_font: font_small
+                  text_color: ${color_light_grey}
+              - label:
+                  id: stg_info_wifi
+                  text: "WiFi: --"
+                  text_font: font_small
+                  text_color: ${color_light_grey}
+              - label:
+                  id: stg_info_uptime
+                  text: "Uptime: --"
+                  text_font: font_small
+                  text_color: ${color_light_grey}
+              - label:
+                  id: stg_info_state
+                  text: "System: OFF"
+                  text_font: font_small
+                  text_color: ${color_light_grey}
+              - label:
+                  text: "Maestro Hydronic v0.6.0"
+                  text_font: font_small
+                  text_color: ${color_light_grey}
